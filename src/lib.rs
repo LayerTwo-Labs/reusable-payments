@@ -5,3 +5,11 @@
 //! transaction scanning — operating purely on `bitcoin` types.
 
 pub mod bip47;
+pub mod scan;
+pub mod silent_payments;
+
+mod util;
+pub use util::bip44_coin_type;
+
+#[cfg(test)]
+mod silent_payments_test_vectors;
