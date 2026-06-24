@@ -3,3 +3,5 @@
 //! Wallet-agnostic primitives — payment-code parsing, notification blinding,
 //! send/receive address derivation, silent-payment address handling, and
 //! transaction scanning — operating purely on `bitcoin` types.
+
+pub mod bip47;
