@@ -1,0 +1,10 @@
+edition = "2021"
+
+# Sort every `use` list alphabetically
+reorder_imports = true
+
+# Force std / external / local groups separated by one blank line
+group_imports = "StdExternalCrate"
+
+# Merge paths from the same root crate
+imports_granularity = "Crate"

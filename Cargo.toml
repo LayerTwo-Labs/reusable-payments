@@ -1,0 +1,38 @@
+[package]
+name = "reusable-payments"
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "Ash Manning <ash@layertwolabs.com>",
+    "Nikita Chashchinskii <nikita.chashchinskii@gmail.com>",
+    "Torkel Rogstad <torkel@rogstad.io>",
+]
+license-file = "LICENSE.txt"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+bitcoin = { version = "0.32.100", features = ["rand-std"] }
+thiserror = "2.0.18"
+tracing = "0.1.40"
+
+[dev-dependencies]
+hex = "0.4.3"
+serde_json = "1.0.150"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+allow_attributes = "deny"
+assertions_on_result_states = "allow"
+let_unit_value = "allow"
+print_stderr = "deny"
+print_stdout = "deny"
+significant_drop_in_scrutinee = "deny"
+significant_drop_tightening = "deny"
+wildcard_imports = "deny"
+
+[lints.rust]
+let_underscore_drop = "deny"
+unfulfilled_lint_expectations = "deny"
