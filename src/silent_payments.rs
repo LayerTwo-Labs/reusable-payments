@@ -314,6 +314,25 @@ pub fn labeled_address<C: Signing + Verification>(
     Ok(SilentPaymentAddress::base(scan_pub, labeled_spend, network))
 }
 
+/// Silent-payment address for the given scan/spend keys; labeled when `label`
+/// is `Some`, otherwise the base address.
+pub fn derive_address<C: Signing + Verification>(
+    b_scan: &SecretKey,
+    b_spend: &SecretKey,
+    label: Option<u32>,
+    network: Network,
+    secp: &Secp256k1<C>,
+) -> Result<SilentPaymentAddress, CryptoError> {
+    match label {
+        None => Ok(SilentPaymentAddress::base(
+            b_scan.public_key(secp),
+            b_spend.public_key(secp),
+            network,
+        )),
+        Some(m) => labeled_address(b_scan, b_spend, m, network, secp),
+    }
+}
+
 pub type Recipient = (SilentPaymentAddress, bitcoin::Amount);
 
 pub struct EligibleInput {
@@ -369,23 +388,29 @@ pub fn compute_outputs<C: Signing + Verification>(
     let input_hash = tagged_hash(TAG_INPUTS, &inputs_data);
     require_nonzero_scalar(&input_hash)?;
 
-    let mut groups: BTreeMap<[u8; 33], Vec<&Recipient>> = BTreeMap::new();
-    for r in recipients {
-        groups.entry(r.0.scan.serialize()).or_default().push(r);
+    let mut groups: BTreeMap<[u8; 33], Vec<(usize, &Recipient)>> = BTreeMap::new();
+    for (idx, r) in recipients.iter().enumerate() {
+        groups
+            .entry(r.0.scan.serialize())
+            .or_default()
+            .push((idx, r));
     }
 
-    let mut out = Vec::with_capacity(recipients.len());
+    // Outputs are returned in the same order as `recipients`, so callers can map
+    // each output back to its recipient by index without knowing the internal
+    // per-scan-key grouping.
+    let mut out: Vec<Option<bitcoin::TxOut>> = (0..recipients.len()).map(|_| None).collect();
     for (_scan_ser, group) in groups {
         if group.len() > 2323 {
             return Err(CryptoError::TooManyOutputs);
         }
-        let b_scan = group[0].0.scan;
+        let b_scan = group[0].1.0.scan;
 
         let scaled = scalar_mul(&a, &input_hash)?;
         let ecdh_point = ecdh::shared_secret_point(&b_scan, &scaled);
         let ecdh_pub = compressed_point(&ecdh_point);
 
-        for (k, r) in group.iter().enumerate() {
+        for (k, (idx, r)) in group.iter().enumerate() {
             let b_m = r.0.spend;
             let amount = r.1;
             let mut buf = [0u8; 33 + 4];
@@ -398,13 +423,16 @@ pub fn compute_outputs<C: Signing + Verification>(
             let script = bitcoin::ScriptBuf::new_p2tr_tweaked(
                 bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly),
             );
-            out.push(bitcoin::TxOut {
+            out[*idx] = Some(bitcoin::TxOut {
                 value: amount,
                 script_pubkey: script,
             });
         }
     }
-    Ok(out)
+    Ok(out
+        .into_iter()
+        .map(|o| o.expect("every recipient yields exactly one output"))
+        .collect())
 }
 
 #[derive(Clone, Debug)]
@@ -946,5 +974,59 @@ mod tests {
         ));
         let ei2 = EligibleInput::new(op, sk, &p2wpkh, &secp);
         assert_eq!(ei2.secret.secret_bytes(), sk.secret_bytes());
+    }
+
+    #[test]
+    fn derive_address_matches_base_and_labeled() {
+        let secp = Secp256k1::new();
+        let seed = det_seed(2300);
+        let (b_scan, b_spend, base) =
+            derive_keys_from_seed(&seed, Network::Regtest, 0, &secp).unwrap();
+        assert_eq!(
+            derive_address(&b_scan, &b_spend, None, Network::Regtest, &secp).unwrap(),
+            base
+        );
+        assert_eq!(
+            derive_address(&b_scan, &b_spend, Some(5), Network::Regtest, &secp).unwrap(),
+            labeled_address(&b_scan, &b_spend, 5, Network::Regtest, &secp).unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_outputs_preserves_recipient_order() {
+        let secp = Secp256k1::new();
+        let mk = |seed: u64| {
+            let mut r = StdRng::seed_from_u64(seed);
+            let scan = SecretKey::new(&mut r).public_key(&secp);
+            let spend = SecretKey::new(&mut r).public_key(&secp);
+            SilentPaymentAddress::base(scan, spend, Network::Regtest)
+        };
+        let a = mk(2201);
+        let b = mk(2202);
+        assert_ne!(a.scan, b.scan);
+
+        let mut rng = StdRng::seed_from_u64(2203);
+        let op = bitcoin::OutPoint::new(
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::hash(b"order")),
+            0,
+        );
+        let inputs = vec![EligibleInput {
+            outpoint: op,
+            secret: SecretKey::new(&mut rng),
+        }];
+        let amt = bitcoin::Amount::from_sat(1000);
+
+        let ab =
+            compute_outputs(&inputs, &[op], &[(a.clone(), amt), (b.clone(), amt)], &secp).unwrap();
+        let ba =
+            compute_outputs(&inputs, &[op], &[(b.clone(), amt), (a.clone(), amt)], &secp).unwrap();
+
+        assert_eq!(ab.len(), 2);
+        assert_ne!(ab[0], ab[1]);
+        assert_eq!(
+            ab[0], ba[1],
+            "output tracks input position, not scan-key order"
+        );
+        assert_eq!(ab[1], ba[0]);
     }
 }
