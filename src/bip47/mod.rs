@@ -21,7 +21,7 @@ pub enum Version {
 }
 
 const V1_BASE58_VERSION_BYTE: u8 = 0x47;
-const V1_PAYLOAD_LEN: usize = 80;
+pub const V1_PAYLOAD_LEN: usize = 80;
 
 const V3_MAGIC: u8 = 0x22;
 const V3_VERSION_BYTE: u8 = 0x03;
@@ -633,6 +633,35 @@ pub fn build_v3_notification_script(
     let a = ephemeral_priv.public_key(secp).serialize();
     let f = recipient.identifier();
     Ok(v3_notification_script(&a, &f, &g))
+}
+
+/// Whether a prevout script type can serve as a BIP47 designated input — i.e.
+/// its spend can expose a public key (P2WPKH, P2PKH, P2SH, or P2TR).
+pub fn can_be_designated_input(spk: &bitcoin::Script) -> bool {
+    spk.is_p2wpkh() || spk.is_p2pkh() || spk.is_p2sh() || spk.is_p2tr()
+}
+
+/// Blinded payment-code payload for a notification to `recipient`: the sender's
+/// payment code (derived from their account xpriv) blinded with the designated
+/// input's private key. Returns the blinded bytes and the sender's payment code.
+pub fn build_blinded_payload(
+    sender_account: &Xpriv,
+    version: Version,
+    designated_priv: &SecretKey,
+    recipient: &PaymentCode,
+    designated_outpoint: OutPoint,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Result<(Vec<u8>, PaymentCode), CryptoError> {
+    let sender_code = payment_code_from_account(sender_account, version, secp);
+    let recipient_notif_pub = recipient.notification_pubkey(secp)?;
+    let blinded = blind(
+        &sender_code,
+        designated_priv,
+        &recipient_notif_pub,
+        designated_outpoint,
+        secp,
+    );
+    Ok((blinded, sender_code))
 }
 
 #[cfg(test)]
