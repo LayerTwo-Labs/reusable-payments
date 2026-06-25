@@ -321,6 +321,26 @@ pub struct EligibleInput {
     pub secret: SecretKey,
 }
 
+impl EligibleInput {
+    /// Build an eligible input, normalizing taproot keys to even parity per
+    /// BIP352 (a P2TR input whose key has odd parity is negated).
+    pub fn new<C: Signing + Verification>(
+        outpoint: bitcoin::OutPoint,
+        secret: SecretKey,
+        spk: &bitcoin::Script,
+        secp: &Secp256k1<C>,
+    ) -> Self {
+        let secret = if spk.is_p2tr()
+            && secret.public_key(secp).x_only_public_key().1 == bitcoin::secp256k1::Parity::Odd
+        {
+            secret.negate()
+        } else {
+            secret
+        };
+        Self { outpoint, secret }
+    }
+}
+
 impl Drop for EligibleInput {
     fn drop(&mut self) {
         self.secret.non_secure_erase();
@@ -900,5 +920,31 @@ mod tests {
         let result_ok = compute_outputs(&inputs, &[in_op], &recipients_ok, &secp);
         assert!(result_ok.is_ok(), "expected 2323-recipient call to succeed");
         assert_eq!(result_ok.unwrap().len(), 2323);
+    }
+
+    #[test]
+    fn eligible_input_new_normalizes_taproot_parity() {
+        let secp = Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(2100);
+        let mut sk = SecretKey::new(&mut rng);
+        while sk.public_key(&secp).x_only_public_key().1 != bitcoin::secp256k1::Parity::Odd {
+            sk = SecretKey::new(&mut rng);
+        }
+        let op = bitcoin::OutPoint::new(
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::hash(b"ei")),
+            0,
+        );
+        let xonly = sk.public_key(&secp).x_only_public_key().0;
+        let p2tr = bitcoin::ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly),
+        );
+        let ei = EligibleInput::new(op, sk, &p2tr, &secp);
+        assert_eq!(ei.secret.secret_bytes(), sk.negate().secret_bytes());
+
+        let p2wpkh = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_raw_hash(
+            bitcoin::hashes::hash160::Hash::hash(&sk.public_key(&secp).serialize()),
+        ));
+        let ei2 = EligibleInput::new(op, sk, &p2wpkh, &secp);
+        assert_eq!(ei2.secret.secret_bytes(), sk.secret_bytes());
     }
 }

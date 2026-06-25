@@ -672,6 +672,92 @@ pub fn block_to_scanned_txs(
         .collect()
 }
 
+/// Errors assembling a [`ScanContext`].
+#[derive(Debug, thiserror::Error)]
+pub enum ContextError {
+    #[error(transparent)]
+    Bip47(#[from] bip47::CryptoError),
+    #[error(transparent)]
+    SilentPayments(#[from] silent_payments::CryptoError),
+    #[error(transparent)]
+    Bip32(#[from] bitcoin::bip32::Error),
+}
+
+/// Derive the BIP47 receive-address lookup for a set of known senders, given the
+/// receiver's BIP47 account xpriv. Each `(sender_code, next_receive_index)` pair
+/// contributes `lookahead` candidate addresses.
+pub fn build_bip47_receive_lookup<C: Signing + Verification>(
+    bip47_account: &bitcoin::bip32::Xpriv,
+    payers: &[(bip47::PaymentCode, u32)],
+    lookahead: u32,
+    network: Network,
+    secp: &Secp256k1<C>,
+) -> Result<HashMap<[u8; 20], Bip47ReceiveSource>, bip47::CryptoError> {
+    if payers.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let v3_root = bip47::v3_root_xpriv(bip47_account, network, secp)?;
+    let mut lookup = HashMap::new();
+    for (sender_code, next_index) in payers {
+        let root = match sender_code.version() {
+            bip47::Version::V1 => bip47_account,
+            bip47::Version::V3 => &v3_root,
+        };
+        let entries =
+            derive_bip47_lookup_entries(root, sender_code, *next_index, lookahead, network, secp)?;
+        lookup.extend(entries);
+    }
+    Ok(lookup)
+}
+
+/// Assemble a [`ScanContext`] from the receiver's BIP47 account xpriv, the
+/// silent-payment scan key and spend public key, the enabled label indices, and
+/// the set of known BIP47 senders.
+#[expect(clippy::too_many_arguments)]
+pub fn build_scan_context<C: Signing + Verification>(
+    bip47_account: &bitcoin::bip32::Xpriv,
+    b_scan: SecretKey,
+    b_spend_pub: PublicKey,
+    label_ms: &[u32],
+    payers: &[(bip47::PaymentCode, u32)],
+    lookahead: u32,
+    network: Network,
+    secp: &Secp256k1<C>,
+) -> Result<ScanContext, ContextError> {
+    let v1_notif_priv = bip47_account
+        .derive_priv(secp, &[bitcoin::bip32::ChildNumber::from_normal_idx(0)?])?
+        .private_key;
+    let v3_master = bip47::v3_root_xpriv(bip47_account, network, secp)?;
+    let v3_notif_priv = v3_master
+        .derive_priv(secp, &[bitcoin::bip32::ChildNumber::from_normal_idx(0)?])?
+        .private_key;
+    let v3_identifier =
+        bip47::payment_code_from_account(bip47_account, bip47::Version::V3, secp).identifier();
+
+    let mut label_set = silent_payments::LabelSet::with_change(&b_scan, secp)?;
+    for m in label_ms {
+        label_set.add(&b_scan, *m, secp)?;
+    }
+
+    let receive_lookup =
+        build_bip47_receive_lookup(bip47_account, payers, lookahead, network, secp)?;
+
+    let bip47_data = Bip47ScanData {
+        v1_notif_priv,
+        v3_notif_priv,
+        v3_identifier,
+        receive_lookup,
+        lookahead,
+    };
+    Ok(ScanContext::new(
+        bip47_data,
+        b_scan,
+        b_spend_pub,
+        label_set,
+        secp,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::secp256k1::rand::{SeedableRng, rngs::StdRng};
@@ -1340,5 +1426,98 @@ mod tests {
             extract_bip47_designated_pubkey(&witness, &empty_sig, &p2wpkh),
             Some(pk)
         );
+    }
+
+    #[test]
+    fn bip47_send_helpers_match_manual_derivation() {
+        let secp = det_secp();
+        let master =
+            bitcoin::bip32::Xpriv::new_master(bitcoin::NetworkKind::Test, &det_seed(1700)).unwrap();
+        let account = master
+            .derive_priv(&secp, &bip47::account_path(1).unwrap())
+            .unwrap();
+
+        for v in [bip47::Version::V1, bip47::Version::V3] {
+            let manual =
+                bip47::PaymentCode::from_xpub(&bitcoin::bip32::Xpub::from_priv(&secp, &account), v);
+            assert_eq!(bip47::payment_code_from_account(&account, v, &secp), manual);
+        }
+
+        assert_eq!(
+            bip47::send_root(&account, bip47::Version::V1, Network::Regtest, &secp)
+                .unwrap()
+                .private_key,
+            account.private_key
+        );
+        assert_eq!(
+            bip47::send_root(&account, bip47::Version::V3, Network::Regtest, &secp)
+                .unwrap()
+                .private_key,
+            bip47::v3_root_xpriv(&account, Network::Regtest, &secp)
+                .unwrap()
+                .private_key
+        );
+
+        let (recipient, _) = bip47_party(1701, bip47::Version::V3);
+        let root = bip47::v3_root_xpriv(&account, Network::Regtest, &secp).unwrap();
+        let a0 = child_priv(&root, 0);
+        let manual =
+            bip47::derive_send_address(&a0, &recipient, 2, Network::Regtest, &secp).unwrap();
+        let helper = bip47::derive_send_address_from_account(
+            &account,
+            &recipient,
+            2,
+            Network::Regtest,
+            &secp,
+        )
+        .unwrap();
+        assert_eq!(manual, helper);
+    }
+
+    #[test]
+    fn build_scan_context_detects_bip47_receive() {
+        let secp = det_secp();
+        let recv_master =
+            bitcoin::bip32::Xpriv::new_master(bitcoin::NetworkKind::Test, &det_seed(1800)).unwrap();
+        let recv_account = recv_master
+            .derive_priv(&secp, &bip47::account_path(1).unwrap())
+            .unwrap();
+        let recv_code = bip47::payment_code_from_account(&recv_account, bip47::Version::V3, &secp);
+
+        let (send_code, send_root) = bip47_party(1801, bip47::Version::V3);
+        let alice_a0 = child_priv(&send_root, 0);
+        let i = 2u32;
+        let pay_pk =
+            bip47::derive_send_pubkey(&alice_a0, &recv_code, i, Network::Regtest, &secp).unwrap();
+        let pay_pkh = hash160(&pay_pk.serialize());
+        let amount = Amount::from_sat(9_000);
+        let mut tx = empty_scanned_tx(1802);
+        tx.p2wpkh_outputs = vec![(0, pay_pkh, amount)];
+
+        let mut rng = StdRng::seed_from_u64(1803);
+        let b_scan = SecretKey::new(&mut rng);
+        let b_spend = SecretKey::new(&mut rng);
+        let ctx = build_scan_context(
+            &recv_account,
+            b_scan,
+            b_spend.public_key(&secp),
+            &[],
+            &[(send_code.clone(), 0)],
+            20,
+            Network::Regtest,
+            &secp,
+        )
+        .unwrap();
+
+        let events = scan_tx(&tx, &ctx, &secp).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ScanEvent::Bip47PaymentReceive { vout, source, .. } => {
+                assert_eq!(*vout, 0);
+                assert_eq!(source.i, i);
+                assert_eq!(source.sender_payment_code, send_code.to_string());
+            }
+            other => panic!("expected Bip47PaymentReceive, got {other:?}"),
+        }
     }
 }

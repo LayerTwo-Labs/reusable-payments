@@ -572,6 +572,69 @@ pub fn account_path(coin: u32) -> Result<bitcoin::bip32::DerivationPath, bitcoin
     Ok(bitcoin::bip32::DerivationPath::from(components.as_slice()))
 }
 
+/// Root xpriv from which send/receive child keys are derived for `version`:
+/// the account itself for v1, the v3-derived root for v3.
+pub fn send_root<C: Verification + bitcoin::secp256k1::Signing>(
+    account: &Xpriv,
+    version: Version,
+    network: Network,
+    secp: &Secp256k1<C>,
+) -> Result<Xpriv, CryptoError> {
+    match version {
+        Version::V1 => Ok(*account),
+        Version::V3 => v3_root_xpriv(account, network, secp),
+    }
+}
+
+/// Payment code for a BIP47 account xpriv at the given version.
+pub fn payment_code_from_account<C: bitcoin::secp256k1::Signing>(
+    account: &Xpriv,
+    version: Version,
+    secp: &Secp256k1<C>,
+) -> PaymentCode {
+    PaymentCode::from_xpub(&Xpub::from_priv(secp, account), version)
+}
+
+/// Send address to `recipient`'s index `i`, deriving the sender's `a0`
+/// notification key from their BIP47 account xpriv.
+pub fn derive_send_address_from_account(
+    account: &Xpriv,
+    recipient: &PaymentCode,
+    i: u32,
+    network: Network,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Result<Address, CryptoError> {
+    let root = send_root(account, recipient.version(), network, secp)?;
+    let mut a0 = root
+        .derive_priv(secp, &[ChildNumber::from_normal_idx(0)?])?
+        .private_key;
+    let result = derive_send_address(&a0, recipient, i, network, secp);
+    a0.non_secure_erase();
+    result
+}
+
+/// v3 notification output script for sending to `recipient`, deriving the
+/// sender's payment code from their account xpriv with a per-tx `ephemeral_priv`.
+pub fn build_v3_notification_script(
+    sender_account: &Xpriv,
+    ephemeral_priv: &SecretKey,
+    recipient: &PaymentCode,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Result<bitcoin::ScriptBuf, CryptoError> {
+    let sender_code = payment_code_from_account(sender_account, Version::V3, secp);
+    let blinded = blind(
+        &sender_code,
+        ephemeral_priv,
+        &recipient.notification_pubkey(secp)?,
+        OutPoint::null(),
+        secp,
+    );
+    let g: [u8; 33] = blinded.try_into().expect("v3 blinded payload is 33 bytes");
+    let a = ephemeral_priv.public_key(secp).serialize();
+    let f = recipient.identifier();
+    Ok(v3_notification_script(&a, &f, &g))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
