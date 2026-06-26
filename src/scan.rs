@@ -758,6 +758,30 @@ pub fn build_scan_context<C: Signing + Verification>(
     ))
 }
 
+/// Recover the spending key for a silent-payment output detected in `tx`, using
+/// the `tweak_k`/`label` recorded at scan time. Recomputes the input pubkey sum
+/// and smallest outpoint from the funding tx, then recovers the key.
+pub fn recover_sp_spending_key<C: Signing + Verification>(
+    b_spend: &SecretKey,
+    b_scan: &SecretKey,
+    tx: &ScannedTx,
+    tweak_k: u32,
+    label: Option<u32>,
+    secp: &Secp256k1<C>,
+) -> Result<SecretKey, silent_payments::CryptoError> {
+    let mut sum_a: Option<PublicKey> = None;
+    for pk in tx.inputs.iter().filter_map(|i| i.pubkey) {
+        sum_a = match sum_a {
+            None => Some(pk),
+            Some(acc) => acc.combine(&pk).ok(),
+        };
+    }
+    let sum_a = sum_a.ok_or(silent_payments::CryptoError::NoEligibleInputs)?;
+    let outpoint_l = util::lex_min_outpoint(tx.inputs.iter().map(|i| i.outpoint))
+        .ok_or(silent_payments::CryptoError::NoEligibleInputs)?;
+    silent_payments::recover_spending_key(b_spend, b_scan, &sum_a, outpoint_l, tweak_k, label, secp)
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::secp256k1::rand::{SeedableRng, rngs::StdRng};
@@ -1519,5 +1543,87 @@ mod tests {
             }
             other => panic!("expected Bip47PaymentReceive, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bip47_recover_receive_priv_matches_paid_key() {
+        let secp = det_secp();
+        let recv_master =
+            bitcoin::bip32::Xpriv::new_master(bitcoin::NetworkKind::Test, &det_seed(2500)).unwrap();
+        let recv_account = recv_master
+            .derive_priv(&secp, &bip47::account_path(1).unwrap())
+            .unwrap();
+        let recv_code = bip47::payment_code_from_account(&recv_account, bip47::Version::V3, &secp);
+
+        let (send_code, send_root) = bip47_party(2501, bip47::Version::V3);
+        let alice_a0 = child_priv(&send_root, 0);
+        let i = 4u32;
+        let pay_pk =
+            bip47::derive_send_pubkey(&alice_a0, &recv_code, i, Network::Regtest, &secp).unwrap();
+
+        let recovered =
+            bip47::recover_receive_priv(&recv_account, &send_code, i, Network::Regtest, &secp)
+                .unwrap();
+        assert_eq!(recovered.public_key(&secp), pay_pk);
+    }
+
+    #[test]
+    fn recover_sp_spending_key_recovers_output() {
+        let secp = det_secp();
+        let seed = det_seed(2400);
+        let (b_scan, b_spend, base_addr) =
+            silent_payments::derive_keys_from_seed(&seed, Network::Regtest, 0, &secp).unwrap();
+        let b_spend_pub = b_spend.public_key(&secp);
+
+        let mut rng = StdRng::seed_from_u64(2401);
+        let in_sk = SecretKey::new(&mut rng);
+        let in_pk = in_sk.public_key(&secp);
+        let in_op = OutPoint::new(
+            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::hash(b"sprec")),
+            0,
+        );
+        let eligible = vec![silent_payments::EligibleInput {
+            outpoint: in_op,
+            secret: in_sk,
+        }];
+        let amount = Amount::from_sat(7_000);
+        let outs =
+            silent_payments::compute_outputs(&eligible, &[in_op], &[(base_addr, amount)], &secp)
+                .unwrap();
+        let xonly = XOnlyPublicKey::from_slice(&outs[0].script_pubkey.as_bytes()[2..]).unwrap();
+
+        let mut tx = empty_scanned_tx(2402);
+        tx.inputs = vec![ScannedInput {
+            outpoint: in_op,
+            pubkey: Some(in_pk),
+        }];
+        tx.taproot_outputs = vec![(0, xonly, amount)];
+
+        let labels = silent_payments::LabelSet::with_change(&b_scan, &secp).unwrap();
+        let ctx = ScanContext::new(
+            Bip47ScanData {
+                v1_notif_priv: SecretKey::new(&mut rng),
+                v3_notif_priv: SecretKey::new(&mut rng),
+                v3_identifier: [0x02; 33],
+                receive_lookup: HashMap::new(),
+                lookahead: 20,
+            },
+            b_scan,
+            b_spend_pub,
+            labels,
+            &secp,
+        );
+        let events = scan_tx(&tx, &ctx, &secp).unwrap();
+        let ScanEvent::SilentPaymentReceive { match_, .. } = &events[0] else {
+            panic!("expected SilentPaymentReceive, got {:?}", events);
+        };
+
+        let d =
+            recover_sp_spending_key(&b_spend, &b_scan, &tx, match_.tweak_k, match_.label, &secp)
+                .unwrap();
+        assert_eq!(
+            d.public_key(&secp).x_only_public_key().0,
+            match_.output_xonly
+        );
     }
 }

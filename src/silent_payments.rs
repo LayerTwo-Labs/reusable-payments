@@ -531,8 +531,9 @@ pub fn scan_tx<C: Verification>(
     Ok(matches)
 }
 
-/// TODO: spend side
-#[cfg(test)]
+/// Recover the private key for a silent-payment output we received, given the
+/// scan/spend keys, the funding tx's input pubkey sum and smallest outpoint, and
+/// the `tweak_k`/`label` recorded at scan time.
 pub fn recover_spending_key<C: Signing + Verification>(
     b_spend: &SecretKey,
     b_scan: &SecretKey,

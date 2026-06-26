@@ -664,6 +664,26 @@ pub fn build_blinded_payload(
     Ok((blinded, sender_code))
 }
 
+/// Private key for a BIP47 payment received at index `i` from `sender_code`,
+/// derived from the receiver's BIP47 account xpriv. The inverse of
+/// [`derive_send_address_from_account`] on the sender side.
+pub fn recover_receive_priv<C: Verification + bitcoin::secp256k1::Signing>(
+    account: &Xpriv,
+    sender_code: &PaymentCode,
+    i: u32,
+    network: Network,
+    secp: &Secp256k1<C>,
+) -> Result<SecretKey, CryptoError> {
+    let root = send_root(account, sender_code.version(), network, secp)?;
+    let mut b_i = root
+        .derive_priv(secp, &[ChildNumber::from_normal_idx(i)?])?
+        .private_key;
+    let sender_notif_pub = sender_code.notification_pubkey(secp)?;
+    let result = derive_receive_priv(&b_i, &sender_notif_pub, sender_code.version(), network);
+    b_i.non_secure_erase();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
