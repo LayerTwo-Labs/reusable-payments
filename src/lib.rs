@@ -7,6 +7,7 @@
 pub mod bip47;
 pub mod scan;
 pub mod silent_payments;
+pub mod spend;
 
 mod util;
 pub use util::bip44_coin_type;
