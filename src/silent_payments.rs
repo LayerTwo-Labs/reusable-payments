@@ -396,10 +396,9 @@ pub fn compute_outputs<C: Signing + Verification>(
             .push((idx, r));
     }
 
-    // Outputs are returned in the same order as `recipients`, so callers can map
-    // each output back to its recipient by index without knowing the internal
-    // per-scan-key grouping.
-    let mut out: Vec<Option<bitcoin::TxOut>> = (0..recipients.len()).map(|_| None).collect();
+    // Returned in `recipients` order (independent of the internal per-scan-key
+    // grouping) so callers can map each output back by index.
+    let mut indexed: Vec<(usize, bitcoin::TxOut)> = Vec::with_capacity(recipients.len());
     for (_scan_ser, group) in groups {
         if group.len() > 2323 {
             return Err(CryptoError::TooManyOutputs);
@@ -423,16 +422,17 @@ pub fn compute_outputs<C: Signing + Verification>(
             let script = bitcoin::ScriptBuf::new_p2tr_tweaked(
                 bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly),
             );
-            out[*idx] = Some(bitcoin::TxOut {
-                value: amount,
-                script_pubkey: script,
-            });
+            indexed.push((
+                *idx,
+                bitcoin::TxOut {
+                    value: amount,
+                    script_pubkey: script,
+                },
+            ));
         }
     }
-    Ok(out
-        .into_iter()
-        .map(|o| o.expect("every recipient yields exactly one output"))
-        .collect())
+    indexed.sort_by_key(|(idx, _)| *idx);
+    Ok(indexed.into_iter().map(|(_, txout)| txout).collect())
 }
 
 #[derive(Clone, Debug)]

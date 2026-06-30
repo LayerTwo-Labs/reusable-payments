@@ -149,7 +149,7 @@ impl PaymentCode {
             network: bitcoin::NetworkKind::Main,
             depth: 3,
             parent_fingerprint: Default::default(),
-            child_number: ChildNumber::from_hardened_idx(0).expect("valid hardened index"),
+            child_number: ChildNumber::Hardened { index: 0 },
             public_key: self.pubkey,
             chain_code: self.chain_code,
         }
